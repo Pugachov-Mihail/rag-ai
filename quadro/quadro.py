@@ -8,7 +8,6 @@ from qdrant_client.models import PointStruct, VectorParams, Distance
 
 # Импортируем классы из вашего детерминированного парсера
 from parcer_files import GoAstParser, DependencyGraphBuilder
-from reader_book import get_ollama_embedding
 
 
 class ProjectContextUpdater:

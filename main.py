@@ -41,7 +41,7 @@ def get_query_embedding(text):
 def get_qdrant_context(query_vector, collection_name, limit=3):
     """Ищет релевантные куски кода или книг в Qdrant"""
     try:
-        results = qdrant_client.search(
+        results = qdrant_client.search_matrix_pairs(
             collection_name=collection_name,
             query_vector=query_vector,
             limit=limit

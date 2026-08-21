@@ -301,6 +301,13 @@ def mock_chat():
 
     return Response(generate(), mimetype='application/x-ndjson')
 
+@app.route('/api/rebuild-db', methods=['POST'])
+def manual_rebuild_db():
+    """Ручной запуск полной пересборки базы данных"""
+    # Запускаем в отдельном потоке, чтобы не блокировать ответ сервера
+    thread = threading.Thread(target=rebuild_vector_db)
+    thread.start()
+    return {"status": "rebuilding", "message": "Пересборка БД Qdrant запущена в фоне"}
 
 if __name__ == "__main__":
     crawler = threading.Thread(target=async_knowledge_crawler, daemon=True)
