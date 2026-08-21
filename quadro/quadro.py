@@ -7,7 +7,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
 
 # Импортируем классы из вашего детерминированного парсера
-from parcer_files import GoAstParser, DependencyGraphBuilder
+from parcer_files.parser import GoAstParser, DependencyGraphBuilder
 
 
 class ProjectContextUpdater:

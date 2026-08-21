@@ -295,6 +295,8 @@ def mock_chat():
                 save_to_long_term_memory(user_query, full_answer, query_vector)
                 print("\n[📢] Ответ сохранен в долгосрочную память ChromaDB.")
 
+            print("Полный ответ: ", full_answer)
+
         except Exception as e:
             yield safe_yield(f"\n[Ошибка консорциума]: {str(e)}")
             yield b'{"done": True}\n'
