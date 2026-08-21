@@ -3,3 +3,5 @@
 go_project_hashes.json
 /books
 /my_library_db
+.DS_Store
+__pycache__
