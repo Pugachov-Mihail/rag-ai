@@ -79,15 +79,18 @@ def should_skip_consultation(messages, max_tokens=MAX_CONTEXT_TOKENS):
 def get_qdrant_context(query_vector, collection_name, limit=3):
     """Ищет архитектурные блоки в Qdrant и извлекает связи related_modules"""
     try:
-        results = qdrant_client.search(
+        results = qdrant_client.query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
+            query=query_vector,  # <-- Изменилось название аргумента
             limit=limit
         )
 
         context_blocks = []
-        for r in results:
+
+        # В новом API результаты лежат внутри results.points
+        for r in results.points:
             meta = r.payload
+
             if collection_name == "go_project_context":
                 component = meta.get('component', 'unknown')
                 dependencies = meta.get('related_modules', [])
@@ -301,6 +304,13 @@ def mock_chat():
 
     return Response(generate(), mimetype='application/x-ndjson')
 
+@app.route('/api/rebuild-db', methods=['POST'])
+def manual_rebuild_db():
+    """Ручной запуск полной пересборки базы данных"""
+    # Запускаем в отдельном потоке, чтобы не блокировать ответ сервера
+    thread = threading.Thread(target=rebuild_vector_db)
+    thread.start()
+    return {"status": "rebuilding", "message": "Пересборка БД Qdrant запущена в фоне"}
 
 if __name__ == "__main__":
     crawler = threading.Thread(target=async_knowledge_crawler, daemon=True)
