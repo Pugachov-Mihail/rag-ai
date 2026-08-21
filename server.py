@@ -233,7 +233,7 @@ def mock_chat():
 
                 draft_messages = agent_messages + [
                     {"role": "user", "content": "Напиши подробный технический черновик ответа."}]
-                draft_content = call_ollama(LLM_MODEL, draft_messages)  # Быстрая модель для наброска
+                draft_content = call_ollama(LLM_MODEL, draft_messages)
 
                 yield safe_yield(f"[🕵️ Шаг 2/3: Аудит ревьюера ({MODEL_CRITIC}) на утечки и связи...]\n\n")
 
@@ -273,6 +273,7 @@ def mock_chat():
                 final_messages = agent_messages
 
             yield safe_yield(f"\n[🧠 Шаг 3/3] Финальный анализатор: {MODEL_CRITIC}...\n\n")
+            print(f"\n==================== ОТВЕТ ИИ ({MODEL_CRITIC}) ====================")
 
             response = requests.post(
                 OLLAMA_CHAT_URL,
@@ -281,24 +282,41 @@ def mock_chat():
                 stream=True, timeout=120
             )
 
+            # ПРОВЕРКА НА ОШИБКИ OLLAMA
+            if response.status_code != 200:
+                error_text = f"Ollama вернула ошибку {response.status_code}: {response.text}"
+                print(f"\n[!] КРИТИЧЕСКАЯ ОШИБКА: {error_text}")
+                yield safe_yield(f"\n[Критическая ошибка]: {error_text}")
+                yield b'{"done": True}\n'
+                return
+
+            # ПОТОКОВОЕ ЧТЕНИЕ И ВЫВОД В ТЕРМИНАЛ
             for line in response.iter_lines():
                 if line:
+                    # Отправляем строку в IDE (Goland)
                     yield line + b'\n'
+
+                    # Парсим строку для вывода в консоль
                     try:
                         chunk_json = json.loads(line.decode('utf-8'))
                         if "message" in chunk_json and "content" in chunk_json["message"]:
-                            full_answer += chunk_json["message"]["content"]
-                    except:
+                            content = chunk_json["message"]["content"]
+                            # Печатаем прямо в терминал без переноса строки (flush=True обязательно)
+                            print(content, end="", flush=True)
+                            full_answer += content
+                    except json.JSONDecodeError:
                         pass
+
+            print("\n===================================================================\n")
 
             if query_vector and full_answer:
                 save_to_long_term_memory(user_query, full_answer, query_vector)
-                print("\n[📢] Ответ сохранен в долгосрочную память ChromaDB.")
-
-            print("Полный ответ: ", full_answer)
+                print("[📢] Ответ сохранен в долгосрочную память ChromaDB.")
 
         except Exception as e:
-            yield safe_yield(f"\n[Ошибка консорциума]: {str(e)}")
+            error_msg = f"\n[Ошибка консорциума]: {str(e)}"
+            print(error_msg)
+            yield safe_yield(error_msg)
             yield b'{"done": True}\n'
 
     return Response(generate(), mimetype='application/x-ndjson')

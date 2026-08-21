@@ -200,7 +200,7 @@ def ask_super_agent(user_query):
                 content = chunk_json["message"]["content"]
                 print(content, end="", flush=True)
                 full_answer += content
-    print()
+    print(full_answer)
 
     # Сохраняем в краткосрочную память текущей сессии
     short_term_history.append({"role": "user", "content": user_query})
