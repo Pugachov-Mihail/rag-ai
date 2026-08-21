@@ -31,15 +31,15 @@ class GoAstParser:
             # ИСПОЛЬЗУЕМ matches вместо captures!
             # Согласно вашему stub: returns List[Tuple[int, Dict[str, Node]]]
             # Мы передаем node и query в matches
-            matches = self.cursor.matches(root_node, self.call_query)
+            matches = self.cursor.matches(root_node)
 
             for pattern_index, captures_dict in matches:
-                # captures_dict это { 'call_name': node }
-                for capture_name, node in captures_dict.items():
-                    start_byte = node.start_byte
-                    end_byte = node.end_byte
-                    all_calls.append((start_byte, end_byte, code[start_byte:end_byte]))
-
+                # В новых версиях tree-sitter captures_dict содержит списки узлов
+                for capture_name, nodes in captures_dict.items():
+                    for node in nodes:
+                        start_byte = node.start_byte
+                        end_byte = node.end_byte
+                        all_calls.append((start_byte, end_byte, code[start_byte:end_byte]))
         except Exception as e:
             print(f"Error during query matches: {e}")
 
@@ -107,27 +107,3 @@ class DependencyGraphBuilder:
 
         for caller in self.graph:
             self.graph[caller] = list(set(self.graph[caller]))
-
-
-if __name__ == "__main__":
-    test_code = """
-package main
-import "fmt"
-func Connect() { fmt.Println("Connect") }
-func Query() { Connect(); fmt.Println("Query") }
-"""
-    test_file = "test.go"
-    with open(test_file, "w") as f:
-        f.write(test_code)
-
-    parser = GoAstParser()
-    chunks = parser.parse_file(test_file)
-
-    builder = DependencyGraphBuilder()
-    builder.build_from_chunks(chunks)
-
-    print("--- Results ---")
-    for caller, callees in sorted(builder.graph.items()):
-        print(f"{caller} -> {callees}")
-
-    if os.path.exists(test_file): os.remove(test_file)

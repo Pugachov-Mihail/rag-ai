@@ -4,6 +4,8 @@ import requests
 import json
 import time
 
+from qdrant_client import QdrantClient
+
 # 1. Конфигурация
 CHROMA_PATH = "./my_library_db"
 EMBED_MODEL = "nomic-embed-text"
@@ -12,6 +14,10 @@ OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 
 GO_PROJECT_PATH = "/Users/pugachev.mihail9/Desktop/work_app/calculator-v2"  # <-- Укажите свой путь
+CRITIC_MODEL = "gemma4:26b"
+
+# Qdrant для кода и книг (как обсуждалось в RAG архитектуре)
+qdrant_client = QdrantClient("localhost", port=6333)
 
 # Подключение к ChromaDB
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -32,27 +38,40 @@ def get_query_embedding(text):
         return None
 
 
-def get_go_project_context(project_path):
-    """Сканирует структуру и интерфейсы Go-проекта"""
-    context = []
-    if not os.path.exists(project_path): return "Папка проекта не найдена."
-    context.append(f"СТРУКТУРА ТЕКУЩЕГО GO-ПРОЕКТА ({os.path.basename(project_path)}):")
-    go_files_content = []
-    for root, dirs, files in os.walk(project_path):
-        dirs[:] = [d for d in dirs if d not in ['.git', 'vendor', 'mocks']]
-        for file in files:
-            if file.endswith('.go'):
-                rel_path = os.path.relpath(os.path.join(root, file), project_path)
-                context.append(f" - {rel_path}")
-                if file in ['main.go', 'wire.go'] or any(
-                        k in file.lower() for k in ['interface', 'service', 'handler', 'repository']):
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                            go_files_content.append(f"\n--- СОДЕРЖИМОЕ ФАЙЛА: {rel_path} ---\n{f.read()}")
-                    except:
-                        pass
-    return "\n".join(context) + "\n\n" + "\n".join(go_files_content[:15])
+def get_qdrant_context(query_vector, collection_name, limit=3):
+    """Ищет релевантные куски кода или книг в Qdrant"""
+    try:
+        results = qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=limit
+        )
 
+        context_blocks = []
+        for r in results:
+            meta = r.payload
+
+            # Если ищем по коду, добавляем связи графа зависимостей
+            if collection_name == "go_project_context":
+                component = meta.get('component', 'unknown')
+                dependencies = meta.get('related_modules', [])
+                filepath = meta.get('file_path', 'unknown')
+
+                block = (
+                    f"Файл: {filepath} | Компонент: {component}\n"
+                    f"Вызывает зависимости: {dependencies}\n"
+                    f"Код:\n{meta.get('content')}"
+                )
+                context_blocks.append(block)
+            else:
+                # Если ищем по книгам
+                block = f"Источник: {meta.get('source')}\n{meta.get('content')}"
+                context_blocks.append(block)
+
+        return "\n---\n".join(context_blocks)
+    except Exception as e:
+        print(f"[!] Ошибка поиска в Qdrant ({collection_name}): {e}")
+        return ""
 
 def get_relevant_chat_memory(user_query, query_vector):
     """Ищет прошлые разговоры, повышает приоритет частым темам и занижает редким"""
@@ -97,9 +116,9 @@ def save_to_long_term_memory(user_query, ai_answer, query_vector):
     )
 
 
-def call_ollama(messages, stream=False):
+def call_ollama(messages, stream=False, model_name=LLM_MODEL):
     try:
-        response = requests.post(OLLAMA_CHAT_URL, json={"model": LLM_MODEL, "messages": messages, "stream": stream},
+        response = requests.post(OLLAMA_CHAT_URL, json={"model": model_name, "messages": messages, "stream": stream},
                                  stream=stream)
         return response
     except:
@@ -111,25 +130,22 @@ def ask_super_agent(user_query):
     query_vector = get_query_embedding(user_query)
     if not query_vector: return
 
-    print("[🔍] Шаг 1: Поиск в книгах и извлечение долгосрочной памяти диалогов...")
-    # Извлекаем знания из книг
-    book_results = books_collection.query(query_embeddings=[query_vector], n_results=3)
-    books_context = "\n---\n".join(book_results['documents'][0])
-
-    # Извлекаем историю старых чатов с учетом приоритетов и затухания
+    print("[🔍] Шаг 1: Поиск в книгах и извлечение памяти...")
+    # Извлекаем знания из книг через Qdrant
+    books_context = get_qdrant_context(query_vector, "books_collection", limit=3)
     long_term_memory_context = get_relevant_chat_memory(user_query, query_vector)
 
-    print("[💻] Шаг 2: Анализ локального Go-проекта...")
-    project_context = get_go_project_context(GO_PROJECT_PATH)
+    print("[💻] Шаг 2: Семантический поиск по AST-структуре Go-проекта...")
+    # Ищем только те функции и структуры графа маршрутизации, которые нужны для ответа
+    project_context = get_qdrant_context(query_vector, "go_project_context", limit=5)
 
-    # Конструируем системный промпт со всеми слоями знаний
     system_instruction = (
         "Ты — ведущий ИИ-архитектор. Реши задачу пользователя.\n"
         f"У тебя есть данные из трех источников:\n"
         f"1. ТЕОРЕТИЧЕСКИЙ КОНТЕКСТ ИЗ КНИГ:\n{books_context}\n\n"
-        f"2. ТВОЙ ПРОШЛЫЙ ОПЫТ ОБЩЕНИЯ С ЭТИМ ПОЛЬЗОВАТЕЛЕМ (ОТФИЛЬТРОВАН ПО ПРИОРИТЕТУ):\n{long_term_memory_context}\n\n"
+        f"2. ПРОШЛЫЙ ОПЫТ (ОТФИЛЬТРОВАН):\n{long_term_memory_context}\n\n"
         f"3. ПРАКТИЧЕСКИЙ КОНТЕКСТ ТЕКУЩЕГО КОДА:\n{project_context}\n\n"
-        "Отвечай технически точно. Структурируй код."
+        "Отвечай технически точно. Строго соблюдай архитектуру проекта и используй указанные зависимости."
     )
 
     messages = [{"role": "system", "content": system_instruction}]
@@ -137,27 +153,33 @@ def ask_super_agent(user_query):
     for msg in short_term_history: messages.append(msg)
     messages.append({"role": "user", "content": user_query})
 
-    print("[🧠] Шаг 3: Самопроверка и аудит черновика ответа...")
-    # Скрытый шаг создания черновика
+    print("[🧠] Шаг 3: Самопроверка и аудит черновика ответа (Gemma 4 26B)...")
+
+    # 3.1 Скрытый шаг создания черновика (быстрая модель)
     draft_messages = messages + [{"role": "user", "content": "Напиши подробный технический черновик ответа."}]
-    res = call_ollama(draft_messages)
+    res = call_ollama(draft_messages, model_name=LLM_MODEL)
     if not res: return
     draft_content = res.json()["message"]["content"]
 
-    # Скрытый шаг жесткой критики
+    # 3.2 Скрытый шаг жесткой критики (Умная модель)
     critic_prompt = (
-        f"Вот твой черновик ответа:\n{draft_content}\n\n"
-        "Проведи жесткий аудит. Соответствует ли код структурам Go-проекта и контексту прошлых бесед? "
-        "Исправь синтаксические ошибки Go и логические нестыковки. Выпиши замечания."
+        f"Вот предварительный черновик ответа:\n{draft_content}\n\n"
+        "Проведи жесткий архитектурный аудит.\n"
+        "1. Зависимости: Проверь, не нарушает ли код существующий граф зависимостей. Убедись, что используются функции, перечисленные в related_modules, и не изобретаются дубликаты.\n"
+        "2. Контекст: Соответствует ли предложенная логика правилам из книг и истории диалога?\n"
+        "3. Качество: Исправь синтаксические ошибки Go, горутины, утечки памяти и логические нестыковки.\n"
+        "Выпиши конкретные замечания."
     )
     critic_messages = messages + [{"role": "assistant", "content": draft_content},
                                   {"role": "user", "content": critic_prompt}]
-    res = call_ollama(critic_messages)
+
+    # Вызываем Gemma 4 26B для критики
+    res = call_ollama(critic_messages, model_name=CRITIC_MODEL)
     if not res: return
     critic_feedback = res.json()["message"]["content"]
 
-    # Финальная сборка идеального ответа
-    final_prompt = "Используя черновик и замечания критика, сформируй финальный идеальный ответ для пользователя. Выведи только его."
+    # 3.3 Финальная сборка идеального ответа (Gemma 4 26B)
+    final_prompt = "Используя черновик и свои замечания аудитора, сформируй финальный идеальный ответ. Выведи только готовое решение и пояснения к нему."
     final_messages = messages + [
         {"role": "assistant", "content": draft_content},
         {"role": "user", "content": critic_prompt},
@@ -168,7 +190,8 @@ def ask_super_agent(user_query):
     print("\n[🎉 Ответ проверен по Книгам, Коду и Истории]")
     print("ИИ: ", end="", flush=True)
 
-    res = call_ollama(final_messages, stream=True)
+    # Финальный стриминг через Gemma
+    res = call_ollama(final_messages, stream=True, model_name=CRITIC_MODEL)
     full_answer = ""
     for line in res.iter_lines():
         if line:
