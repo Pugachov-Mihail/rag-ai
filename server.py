@@ -217,10 +217,15 @@ def mock_chat():
 
     query_vector = get_query_embedding(user_query)
 
-    # Ищем контекст в Qdrant
+    # 1. ЖЕСТКОЕ ОГРАНИЧЕНИЕ КОНТЕКСТА (Защита от переполнения 16k токенов)
     books_context = get_qdrant_context(query_vector, "books_collection", limit=2) if query_vector else ""
-    project_context = get_qdrant_context(query_vector, "go_project_context", limit=4) if query_vector else ""
+    books_context = books_context[:3000]
+
+    project_context = get_qdrant_context(query_vector, "go_project_context", limit=3) if query_vector else ""
+    project_context = project_context[:6000]
+
     long_term_memory_context = get_relevant_chat_memory(user_query, query_vector) if query_vector else ""
+    long_term_memory_context = long_term_memory_context[:2000]
 
     system_instruction = (
         "Ты — ведущий ИИ-архитектор систем на Go.\n"
@@ -230,8 +235,9 @@ def mock_chat():
         "🚨 ПРАВИЛА: Не выдумывай пакеты, которых нет в проекте. Опирайся на related_modules. Выводи точечные Go-диффы."
     )
 
-    agent_messages = [{"role": "system", "content": system_instruction}] + messages[:-1] + [
-        {"role": "user", "content": user_query}]
+    # 2. ОГРАНИЧЕНИЕ ИСТОРИИ (Берем только последние 3 сообщения, чтобы IDE не забивала память)
+    recent_messages = messages[-4:-1] if len(messages) > 3 else messages[:-1]
+    agent_messages = [{"role": "system", "content": system_instruction}] + recent_messages
 
     def generate():
         nonlocal agent_messages
@@ -240,35 +246,46 @@ def mock_chat():
             if not silent_mode:
                 yield safe_yield("[🧠 Шаг 1/3: Проектирование архитектурного черновика...]\n\n")
 
-                draft_messages = agent_messages + [
-                    {"role": "user", "content": "Напиши подробный технический черновик ответа."}]
-                draft_content = call_ollama(LLM_MODEL, draft_messages)
+                # ПРОКИДЫВАЕМ ВОПРОС В ЧЕРНОВИК И ИСПОЛЬЗУЕМ DEEPSEEK (MODEL_CREATOR)
+                draft_prompt = (
+                    f"Исходная задача пользователя: '{user_query}'.\n"
+                    "Напиши подробный технический черновик ответа, который решает ИМЕННО эту задачу, опираясь на предоставленный контекст базы."
+                )
+                draft_messages = agent_messages + [{"role": "user", "content": draft_prompt}]
+                draft_content = call_ollama(MODEL_CREATOR, draft_messages)
 
                 yield safe_yield(f"[🕵️ Шаг 2/3: Аудит ревьюера ({MODEL_CRITIC}) на утечки и связи...]\n\n")
 
+                # ПРОКИДЫВАЕМ ВОПРОС В КРИТИКУ
                 critic_prompt = (
-                    f"Вот черновик ответа:\n{draft_content}\n\n"
-                    "Проведи аудит. Проверь на утечки каналов/горутин. Убедись, что предложенные функции существуют в графе related_modules контекста. Выпиши замечания."
+                    f"НАПОМИНАНИЕ ЗАДАЧИ: Пользователь изначально спросил: '{user_query}'.\n\n"
+                    f"Вот предложенный черновик ответа:\n{draft_content}\n\n"
+                    "Проведи аудит:\n"
+                    "1. Решает ли этот код изначальную проблему пользователя или ушел в сторону?\n"
+                    "2. Проверь код на утечки каналов/горутин и race conditions.\n"
+                    "3. Убедись, что предложенные функции существуют в графе related_modules контекста.\n"
+                    "Выпиши жесткие замечания."
                 )
                 critic_feedback = call_ollama(MODEL_CRITIC,
                                               agent_messages + [{"role": "assistant", "content": draft_content},
                                                                 {"role": "user", "content": critic_prompt}])
 
-                context_for_consultation = f"Проект (суть): {project_context[:1000]}\nАудит: {critic_feedback[:1000]}"
+                # ПРОКИДЫВАЕМ ВОПРОС В СОВЕТНИК
+                context_for_consultation = f"Задача: {user_query}\nПроект (суть): {project_context[:1000]}\nАудит: {critic_feedback[:1000]}"
 
-                # Игнорируем проверку токенов для советника, отправляем укороченный запрос
                 yield safe_yield("[💬] Запрос совета у внешней ИИ (с защитой от RPC лимита)...\n")
                 advisor_feedback = consult_advisor(draft_content, user_query, context_for_consultation)
 
+                # ФИНАЛЬНЫЙ СИНТЕЗ С НАПОМИНАНИЕМ
                 final_prompt = (
-                    f"Вопрос: '{user_query}'.\nЧерновик, аудит и советник переданы ранее.\n"
+                    f"ВОЗВРАЩАЕМСЯ К ИСХОДНОЙ ЗАДАЧЕ: '{user_query}'.\n"
+                    "Черновик, аудит и советник переданы ранее. Они могли уйти в сторону, поэтому твоя цель — дать финальное решение именно на исходный вопрос.\n\n"
                     "Сформируй итоговый ответ НА РУССКОМ ЯЗЫКЕ.\n"
-                    "1. РАЗБОР ПО ЗАПРОСУ: Четкий ответ.\n"
-                    "2. СКРЫТЫЕ ОШИБКИ И УТЕЧКИ: Анализ багов конкурентности.\n"
-                    "3. ИСПРАВЛЕННЫЙ GO-КОД: Готовый дифф.\n"
+                    "1. РАЗБОР ПО ЗАПРОСУ: Четкий ответ на вопрос.\n"
+                    "2. СКРЫТЫЕ ОШИБКИ И УТЕЧКИ: Анализ багов конкурентности (если есть).\n"
+                    "3. ИСПРАВЛЕННЫЙ GO-КОД: Готовый дифф для интеграции.\n"
                 )
 
-                # Собираем ПОЛНЫЙ контекст исключительно для локальной Gemma4:26b
                 final_messages = agent_messages + [
                     {"role": "assistant", "content": draft_content},
                     {"role": "user", "content": critic_prompt},
@@ -278,12 +295,12 @@ def mock_chat():
                     {"role": "user", "content": final_prompt}
                 ]
             else:
-                final_messages = agent_messages
+                # Если silent_mode, всё равно прокидываем вопрос явно
+                final_messages = agent_messages + [{"role": "user", "content": user_query}]
 
             yield safe_yield(f"\n[🧠 Шаг 3/3] Финальный анализатор: {MODEL_CRITIC}...\n\n")
             print(f"\n==================== ОТВЕТ ИИ ({MODEL_CRITIC}) ====================")
 
-            # Финальный потоковый вывод через тяжелую модель
             response = requests.post(
                 OLLAMA_CHAT_URL,
                 json={"model": MODEL_CRITIC, "messages": final_messages, "stream": True,},
@@ -301,15 +318,11 @@ def mock_chat():
             # ПОТОКОВОЕ ЧТЕНИЕ И ВЫВОД В ТЕРМИНАЛ
             for line in response.iter_lines():
                 if line:
-                    # Отправляем строку в IDE (Goland)
                     yield line + b'\n'
-
-                    # Парсим строку для вывода в консоль
                     try:
                         chunk_json = json.loads(line.decode('utf-8'))
                         if "message" in chunk_json and "content" in chunk_json["message"]:
                             content = chunk_json["message"]["content"]
-                            # Печатаем прямо в терминал без переноса строки (flush=True обязательно)
                             print(content, end="", flush=True)
                             full_answer += content
                     except json.JSONDecodeError:
@@ -317,7 +330,12 @@ def mock_chat():
 
             print("\n===================================================================\n")
 
-            if query_vector and full_answer:
+            # ОТЛОВ ПУСТОГО ОТВЕТА (OOM)
+            if not full_answer.strip():
+                warning_msg = "\n[⚠️] Модель сгенерировала пустой ответ. Возможна нехватка памяти (OOM) из-за слишком длинного контекста."
+                print(warning_msg)
+                yield safe_yield(warning_msg)
+            elif query_vector:
                 save_to_long_term_memory(user_query, full_answer, query_vector)
                 print("[📢] Ответ сохранен в долгосрочную память ChromaDB.")
 
