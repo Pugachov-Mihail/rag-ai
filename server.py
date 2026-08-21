@@ -286,9 +286,8 @@ def mock_chat():
             # Финальный потоковый вывод через тяжелую модель
             response = requests.post(
                 OLLAMA_CHAT_URL,
-                json={"model": MODEL_CRITIC, "messages": final_messages, "stream": True,
-                      "options": {"num_ctx": MAX_CONTEXT_TOKENS}},
-                stream=True, timeout=180
+                json={"model": MODEL_CRITIC, "messages": final_messages, "stream": True,},
+                stream=True, timeout=360
             )
 
             # ПРОВЕРКА НА ОШИБКИ OLLAMA
