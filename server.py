@@ -79,14 +79,14 @@ def should_skip_consultation(messages, max_tokens=MAX_CONTEXT_TOKENS):
 def get_qdrant_context(query_vector, collection_name, limit=3):
     """Ищет архитектурные блоки в Qdrant и извлекает связи related_modules"""
     try:
-        results = qdrant_client.search(
-            collection_name=collection_name,
-            query_vector=query_vector,
+        results = qdrant_client.query_points(
+            collection_name= collection_name, #"books_collection",
+            query=query_vector,
             limit=limit
         )
 
         context_blocks = []
-        for r in results:
+        for r in results.points:
             meta = r.payload
             if collection_name == "go_project_context":
                 component = meta.get('component', 'unknown')
