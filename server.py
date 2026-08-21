@@ -157,17 +157,26 @@ def call_ollama(model_name, messages):
 
 
 def consult_advisor(model_critic_draft, user_query, context_info, go_project_path=GO_PROJECT_PATH):
+    # ЖЕСТКАЯ ОБРЕЗКА ДЛЯ ВНЕШНЕЙ ИИ (Защита от лимитов RPC 16k)
+    safe_context = context_info[:3000]
+    safe_draft = model_critic_draft[:3000]
+
     advisor_prompt = (
         f"Ты — внешний консультант Go-архитектора.\nВопрос пользователя: '{user_query}'\n\n"
-        f"Справочная информация:\n{context_info}\n\nЧерновик решения:\n{model_critic_draft}\n\n"
-        f"Укажи 3-5 конкретных улучшений, багов или узких мест конкурентности. Только нумерованный список."
+        f"Справочная информация (выжимка):\n{safe_context}\n\n"
+        f"Черновик решения (выжимка):\n{safe_draft}\n\n"
+        f"Укажи 3-5 конкретных багов или узких мест конкурентности. Только нумерованный список."
     )
+
     try:
+        # Отправка во внешний агент
         result = subprocess.run([OPENCODE_BIN, "run", "--agent", "plan", "--dir", go_project_path, advisor_prompt],
                                 capture_output=True, text=True, encoding='utf-8', timeout=90)
         if result.returncode == 0 and result.stdout.strip(): return result.stdout
     except:
         pass
+
+    # Фолбэк на внешнюю модель
     return call_ollama(ADVISOR_MODEL, [{"role": "user", "content": advisor_prompt}])
 
 
@@ -245,13 +254,11 @@ def mock_chat():
                                               agent_messages + [{"role": "assistant", "content": draft_content},
                                                                 {"role": "user", "content": critic_prompt}])
 
-                context_for_consultation = f"Книги: {books_context[:500]}\nПроект: {project_context[:800]}\nАудит: {critic_feedback[:1500]}"
+                context_for_consultation = f"Проект (суть): {project_context[:1000]}\nАудит: {critic_feedback[:1000]}"
 
-                if not should_skip_consultation(agent_messages):
-                    yield safe_yield("[💬] Запрос совета у OpenCode...\n")
-                    advisor_feedback = consult_advisor(draft_content, user_query, context_for_consultation)
-                else:
-                    advisor_feedback = "Консультация пропущена."
+                # Игнорируем проверку токенов для советника, отправляем укороченный запрос
+                yield safe_yield("[💬] Запрос совета у внешней ИИ (с защитой от RPC лимита)...\n")
+                advisor_feedback = consult_advisor(draft_content, user_query, context_for_consultation)
 
                 final_prompt = (
                     f"Вопрос: '{user_query}'.\nЧерновик, аудит и советник переданы ранее.\n"
@@ -261,6 +268,7 @@ def mock_chat():
                     "3. ИСПРАВЛЕННЫЙ GO-КОД: Готовый дифф.\n"
                 )
 
+                # Собираем ПОЛНЫЙ контекст исключительно для локальной Gemma4:26b
                 final_messages = agent_messages + [
                     {"role": "assistant", "content": draft_content},
                     {"role": "user", "content": critic_prompt},
@@ -274,11 +282,12 @@ def mock_chat():
 
             yield safe_yield(f"\n[🧠 Шаг 3/3] Финальный анализатор: {MODEL_CRITIC}...\n\n")
 
+            # Финальный потоковый вывод через тяжелую модель
             response = requests.post(
                 OLLAMA_CHAT_URL,
                 json={"model": MODEL_CRITIC, "messages": final_messages, "stream": True,
                       "options": {"num_ctx": MAX_CONTEXT_TOKENS}},
-                stream=True, timeout=120
+                stream=True, timeout=180
             )
 
             for line in response.iter_lines():
