@@ -92,5 +92,5 @@ websocket-client==1.9.0
 websockets==17.0.1
 Werkzeug==3.1.8
 yarl==1.24.5
-
+watchdog>=4.0.0
 qdrant-client~=1.19.0

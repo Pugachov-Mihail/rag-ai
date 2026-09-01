@@ -4,6 +4,9 @@ import os
 import glob
 import time
 
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 from quadro.quadro import ProjectContextUpdater
 
 GO_PROJECT_PATH = "/Users/pugachev.mihail9/Desktop/work_app/calculator-v2"
@@ -132,19 +135,57 @@ def build_project_arch_profile() -> None:
     except Exception as e:
         print(f"[!] Ошибка при обновлении архитектурного профиля: {e}")
 
+class GoFileHandler(FileSystemEventHandler):
+    def __init__(self, project_path: str, updater: ProjectContextUpdater):
+        self.project_path = os.path.abspath(project_path)
+        self.updater = updater
 
-def async_knowledge_crawler() -> None:
-    """Фоновый краулер: код, книги и архитектура проекта."""
-    print("[🕷] Краулер Qdrant запущен (код + книги + архитектура).")
-    updater._ensure_collections()
-    while True:
+    def on_modified(self, event):
+        self._handle(event)
+
+    def on_created(self, event):
+        self._handle(event)
+
+    def _handle(self, event):
+        if event.is_directory:
+            return
+        if not event.src_path.endswith(".go"):
+            return
+        if not event.src_path.startswith(self.project_path):
+            return
+
+        print(f"[🔁] Изменён Go-файл: {event.src_path}")
+        # Перепарсим только этот файл
         try:
-            sync_books()
-            sync_go_project()
-            build_project_arch_profile()
-        except Exception as e:
-            print(f"[!] Ошибка в цикле краулера: {e}")
-        time.sleep(15)
+            self.updater.qdrant.delete(
+                collection_name="go_project_context",
+                points_selector={
+                    "filter": {"must": [{"key": "file_path", "match": {"value": event.src_path}}]}
+                },
+            )
+        except Exception:
+            pass
+        self.updater.sync_file(event.src_path)
+        # Опционально — обновить архитектурный профиль (можно дебаунсить по времени)
+        self.updater.build_arch_profile("project_arch_profile")
+
+def async_knowledge_crawler():
+    """Фоновый демон: следит за изменениями .go-файлов, обновляет Qdrant и архитектурный профиль."""
+    print("[🕷] Watchdog-краулер запущен (Go-файлы + архитектура).")
+    updater._ensure_collections()
+
+    event_handler = GoFileHandler(GO_PROJECT_PATH, updater)
+    observer = Observer()
+    observer.schedule(event_handler, path=GO_PROJECT_PATH, recursive=True)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
 
 
 if __name__ == "__main__":
