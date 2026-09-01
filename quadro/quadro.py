@@ -254,12 +254,14 @@ class ProjectContextUpdater:
         try:
             offset = None
             while True:
-                res = client.scroll(
+                # scroll возвращает (points, next_offset)
+                points, offset = self.qdrant.scroll(
                     collection_name="go_project_context",
                     limit=256,
                     offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
                 )
-                points, offset = res.points, res.next_page_offset
                 if not points:
                     break
 
