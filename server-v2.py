@@ -3,11 +3,11 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import chromadb
 import requests
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from qdrant_client import QdrantClient
 
 from reader_book import async_knowledge_crawler, rebuild_vector_db
@@ -22,14 +22,9 @@ REVIEW_MODEL = "gemma4:26b"
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 MAX_CONTEXT_TOKENS = 16384
-BOOKS_TOP_K = 4
-PROJECT_TOP_K = 6
-MEMORY_TOP_K = 2
-BOOKS_MAX_CHARS = 4000
-PROJECT_MAX_CHARS = 8000
-MEMORY_MAX_CHARS = 1200
-RECENT_MESSAGES_LIMIT = 4
 CPU_HEAVY_THRESHOLD = 75.0
+MEMORY_TOP_K = 2
+RECENT_MESSAGES_LIMIT = 4
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 memory_collection = chroma_client.get_or_create_collection(name="chat_memory")
@@ -46,6 +41,9 @@ class QueryPlan:
     need_diff: bool
     need_architecture: bool
     ultra_short: bool
+    code_query: str
+    books_query: str
+    memory_query: str
 
 
 @dataclass
@@ -53,27 +51,7 @@ class RetrievedContext:
     books: str
     project: str
     memory: str
-
-
-def safe_json_response(payload: Dict, status: int = 200) -> Response:
-    return Response(json.dumps(payload, ensure_ascii=False), status=status, mimetype="application/json")
-
-
-def safe_yield(text_content: str) -> bytes:
-    payload = {"message": {"role": "assistant", "content": text_content}, "done": False}
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
-
-
-def trim_text(text: str, limit: int) -> str:
-    if not text or len(text) <= limit:
-        return text
-    return text[:limit] + "\n...[truncated]"
-
-
-def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+    meta: Dict
 
 
 def get_cpu_load_macos() -> float:
@@ -85,15 +63,35 @@ def get_cpu_load_macos() -> float:
         return 20.0
 
 
+def trim_text(text: str, limit: int) -> str:
+    if not text or len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def to_json_line(payload: Dict) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def make_ollama_chunk(text: str, done: bool = False) -> bytes:
+    return to_json_line({"message": {"role": "assistant", "content": text}, "done": done})
+
+
+def get_query_embedding(text: str) -> Optional[List[float]]:
+    try:
+        response = requests.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "prompt": text}, timeout=20)
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        return data.get("embedding") or data.get("embeddings")
+    except Exception:
+        return None
+
+
 def ollama_chat(model_name: str, messages: List[Dict], stream: bool = False, timeout: int = 240):
     return requests.post(
         OLLAMA_CHAT_URL,
-        json={
-            "model": model_name,
-            "messages": messages,
-            "stream": stream,
-            "options": {"num_ctx": MAX_CONTEXT_TOKENS},
-        },
+        json={"model": model_name, "messages": messages, "stream": stream, "options": {"num_ctx": MAX_CONTEXT_TOKENS}},
         stream=stream,
         timeout=timeout,
     )
@@ -110,79 +108,50 @@ def call_ollama_text(model_name: str, messages: List[Dict], timeout: int = 240) 
         return f"Ошибка вызова модели {model_name}: {exc}"
 
 
-def get_query_embedding(text: str) -> Optional[List[float]]:
-    try:
-        response = requests.post(
-            OLLAMA_EMBED_URL,
-            json={"model": EMBED_MODEL, "prompt": text},
-            timeout=20,
-        )
-        if response.status_code != 200:
-            return None
-        data = response.json()
-        return data.get("embedding") or data.get("embeddings")
-    except Exception:
-        return None
-
-
 def infer_ultra_short(user_query: str, mode: str) -> bool:
     text = (user_query or "").lower()
-    return mode == "ultra-short" or any(marker in text for marker in [
-        "ultra-short", "ultrashort", "коротко", "в 5-8 строк", "без воды", "кратко", "в двух словах"
-    ])
+    return mode == "ultra-short" or any(marker in text for marker in ["ultra-short", "коротко", "без воды", "в 5-8 строк", "кратко"])
 
 
-def build_query_plan(user_query: str, mode: str) -> QueryPlan:
+def build_base_plan(user_query: str, mode: str) -> QueryPlan:
     text = (user_query or "").lower()
-    ultra_short = infer_ultra_short(user_query, mode)
-    architecture_markers = [
-        "архитект", "architecture", "refactor", "рефактор", "масштаб", "ddd", "cqrs", "event sourcing",
-        "bounded context", "декомпоз", "границ", "слой", "модул"
-    ]
-    bugfix_markers = ["fix", "исправ", "ошиб", "bug", "panic", "не работает", "race", "goroutine", "deadlock", "channel"]
-    explain_markers = ["почему", "как работает", "объясни", "explain"]
-
-    need_architecture = mode == "consult" or any(marker in text for marker in architecture_markers)
-    need_diff = any(marker in text for marker in bugfix_markers)
-    task_type = "architecture" if need_architecture else "implementation"
-    if not need_architecture and any(marker in text for marker in explain_markers):
-        task_type = "explain"
-
-    if task_type == "architecture":
-        response_mode = "ultra-short" if ultra_short else "plan"
-        return QueryPlan(task_type, response_mode, 4, 5, True, False, True, ultra_short)
-    if need_diff:
-        response_mode = "ultra-short" if ultra_short else "diff"
-        return QueryPlan(task_type, response_mode, 3, 6, True, True, False, ultra_short)
-    response_mode = "ultra-short" if ultra_short else "standard"
-    return QueryPlan(task_type, response_mode, 3, 4, False, False, False, ultra_short)
-
-
-def planner_refine_plan(user_query: str, base_plan: QueryPlan, recent_messages: List[Dict]) -> QueryPlan:
-    planner_prompt = (
-        "Ты планировщик RAG для Go-помощника внутри IDE.\n"
-        "Твоя задача — не отвечать на вопрос, а только уточнить план retrieval/answering.\n"
-        "Верни JSON с полями: task_type, response_mode, books_top_k, project_top_k, needs_review, need_diff, need_architecture, ultra_short.\n"
-        "Не усложняй. Если запрос локальный, оставь минимальный retrieval. Если архитектурный — можно усилить review."
+    ultra = infer_ultra_short(user_query, mode)
+    need_arch = mode == "consult" or any(x in text for x in ["архитект", "рефактор", "ddd", "cqrs", "слой", "модул", "bounded context"])
+    need_diff = any(x in text for x in ["fix", "исправ", "ошиб", "bug", "не работает", "panic", "race", "deadlock", "утеч"])
+    task_type = "architecture" if need_arch else "implementation"
+    response_mode = "ultra-short" if ultra else ("plan" if need_arch else ("diff" if need_diff else "standard"))
+    return QueryPlan(
+        task_type=task_type,
+        response_mode=response_mode,
+        books_top_k=4 if need_arch else 3,
+        project_top_k=6 if need_diff or need_arch else 4,
+        needs_review=True if need_arch or need_diff else False,
+        need_diff=need_diff,
+        need_architecture=need_arch,
+        ultra_short=ultra,
+        code_query=user_query,
+        books_query=user_query,
+        memory_query=user_query,
     )
-    messages = [{"role": "system", "content": planner_prompt}]
-    for msg in recent_messages[-2:]:
+
+
+def planner_refine(user_query: str, base_plan: QueryPlan, incoming_messages: List[Dict]) -> QueryPlan:
+    planner_prompt = (
+        "Ты planner для IDE coding assistant с RAG. Не отвечай на вопрос пользователя.\n"
+        "Верни JSON с полями: task_type, response_mode, books_top_k, project_top_k, needs_review, need_diff, need_architecture, ultra_short, code_query, books_query, memory_query.\n"
+        "code_query должен быть оптимизирован под поиск по коду, books_query — под поиск в книгах, memory_query — под память.\n"
+        "Не усложняй. Дай короткие retrieval-запросы."
+    )
+    msgs = [{"role": "system", "content": planner_prompt}]
+    for msg in incoming_messages[-2:]:
         role = msg.get("role")
         content = (msg.get("content") or "").strip()
         if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": trim_text(content, 500)})
-    messages.append({
-        "role": "user",
-        "content": (
-            f"Исходный запрос: {user_query}\n"
-            f"Текущий базовый план: {json.dumps(base_plan.__dict__, ensure_ascii=False)}\n"
-            "Верни только JSON."
-        )
-    })
-    raw = call_ollama_text(PLANNER_MODEL, messages, timeout=90).strip()
+            msgs.append({"role": role, "content": trim_text(content, 500)})
+    msgs.append({"role": "user", "content": f"Запрос: {user_query}\nБазовый план: {json.dumps(base_plan.__dict__, ensure_ascii=False)}\nВерни только JSON."})
+    raw = call_ollama_text(PLANNER_MODEL, msgs, timeout=90).strip()
     try:
-        start = raw.find("{")
-        end = raw.rfind("}")
+        start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             return base_plan
         data = json.loads(raw[start:end + 1])
@@ -195,196 +164,186 @@ def planner_refine_plan(user_query: str, base_plan: QueryPlan, recent_messages: 
             need_diff=bool(data.get("need_diff", base_plan.need_diff)),
             need_architecture=bool(data.get("need_architecture", base_plan.need_architecture)),
             ultra_short=bool(data.get("ultra_short", base_plan.ultra_short)),
+            code_query=(data.get("code_query") or base_plan.code_query)[:200],
+            books_query=(data.get("books_query") or base_plan.books_query)[:200],
+            memory_query=(data.get("memory_query") or base_plan.memory_query)[:200],
         )
     except Exception:
         return base_plan
 
 
-def query_qdrant(collection_name: str, query_vector: List[float], limit: int) -> List[Dict]:
+def query_qdrant(collection_name: str, query_text: str, limit: int) -> List[Dict]:
+    vector = get_query_embedding(query_text)
+    if not vector:
+        return []
     try:
-        result = qdrant_client.query_points(collection_name=collection_name, query=query_vector, limit=limit)
+        result = qdrant_client.query_points(collection_name=collection_name, query=vector, limit=limit)
         return [point.payload or {} for point in result.points]
     except Exception as exc:
-        print(f"[!] Ошибка поиска в Qdrant ({collection_name}): {exc}")
+        print(f"[!] Qdrant search error in {collection_name}: {exc}")
         return []
 
 
-def render_book_blocks(items: List[Dict]) -> str:
-    blocks = []
-    for item in items:
-        source = item.get("source", "Книга")
-        content = item.get("content", "")
-        blocks.append(f"Источник: {source}\nФрагмент:\n{content}")
-    return "\n---\n".join(blocks)
-
-
-def render_project_blocks(items: List[Dict]) -> str:
-    blocks = []
-    for item in items:
-        filepath = item.get("file_path", "unknown")
-        component = item.get("component", "unknown")
-        related = item.get("related_modules", [])
-        content = item.get("content", "")
-        blocks.append(
-            f"Файл: {filepath}\nКомпонент: {component}\nRelated modules: {related}\nКод:\n{content}"
-        )
-    return "\n---\n".join(blocks)
-
-
-def get_relevant_chat_memory(query_vector: List[float]) -> str:
+def get_relevant_chat_memory(query_text: str) -> str:
     try:
-        if memory_collection.count() == 0:
+        vector = get_query_embedding(query_text)
+        if not vector or memory_collection.count() == 0:
             return ""
-        results = memory_collection.query(query_embeddings=[query_vector], n_results=MEMORY_TOP_K)
+        results = memory_collection.query(query_embeddings=[vector], n_results=MEMORY_TOP_K)
         docs = results.get("documents", [[]])
         metas = results.get("metadatas", [[]])
         ids = results.get("ids", [[]])
         if not docs or not docs[0]:
             return ""
         current_time = time.time()
-        chunks: List[str] = []
+        chunks = []
         for doc, meta, doc_id in zip(docs[0], metas[0], ids[0]):
             score = float(meta.get("score", 1.0))
             timestamp = float(meta.get("timestamp", current_time))
-            days_passed = (current_time - timestamp) / 86400
-            decayed = score * (0.95 ** days_passed)
+            decayed = score * (0.95 ** ((current_time - timestamp) / 86400))
             memory_collection.update(ids=[doc_id], metadatas=[{"score": min(score + 0.1, 3.0), "timestamp": current_time}])
             if decayed >= 0.45:
                 chunks.append(doc)
         return "\n---\n".join(chunks)
     except Exception as exc:
-        print(f"[!] Ошибка чтения памяти: {exc}")
+        print(f"[!] Memory error: {exc}")
         return ""
 
 
-def save_to_long_term_memory(user_query: str, ai_answer: str, query_vector: Optional[List[float]]) -> None:
-    if not query_vector or not ai_answer.strip():
-        return
-    try:
-        memory_id = f"mem_{int(time.time() * 1000)}"
-        compact_answer = trim_text(ai_answer, 1200)
-        combined = f"Вопрос пользователя: {user_query}\nКраткий ответ: {compact_answer}"
-        memory_collection.add(
-            embeddings=[query_vector],
-            documents=[combined],
-            ids=[memory_id],
-            metadatas=[{"score": 1.0, "timestamp": time.time()}],
-        )
-    except Exception as exc:
-        print(f"[!] Ошибка сохранения памяти: {exc}")
+def render_blocks(items: List[Dict], kind: str) -> Tuple[str, List[str]]:
+    blocks, refs = [], []
+    for item in items:
+        if kind == "code":
+            file_path = item.get("file_path", "unknown")
+            component = item.get("component", "unknown")
+            related = item.get("related_modules", [])
+            refs.append(file_path)
+            blocks.append(f"Файл: {file_path}\nКомпонент: {component}\nRelated: {related}\nКод:\n{item.get('content', '')}")
+        else:
+            source = item.get("source", "Книга")
+            refs.append(source)
+            blocks.append(f"Источник: {source}\nФрагмент:\n{item.get('content', '')}")
+    return "\n---\n".join(blocks), refs
 
 
-def build_context(query_vector: Optional[List[float]], plan: QueryPlan) -> RetrievedContext:
-    if not query_vector:
-        return RetrievedContext("", "", "")
-    book_items = query_qdrant("books_collection", query_vector, plan.books_top_k)
-    project_items = query_qdrant("go_project_context", query_vector, plan.project_top_k)
-    memory_text = get_relevant_chat_memory(query_vector)
+def build_context(plan: QueryPlan) -> RetrievedContext:
+    code_items = query_qdrant("go_project_context", plan.code_query, plan.project_top_k)
+    book_items = query_qdrant("books_collection", plan.books_query, plan.books_top_k)
+    memory_text = get_relevant_chat_memory(plan.memory_query)
+    code_text, code_refs = render_blocks(code_items, "code")
+    book_text, book_refs = render_blocks(book_items, "book")
     return RetrievedContext(
-        books=trim_text(render_book_blocks(book_items), BOOKS_MAX_CHARS),
-        project=trim_text(render_project_blocks(project_items), PROJECT_MAX_CHARS),
-        memory=trim_text(memory_text, MEMORY_MAX_CHARS),
+        books=trim_text(book_text, 4000),
+        project=trim_text(code_text, 9000),
+        memory=trim_text(memory_text, 1200),
+        meta={
+            "code_query": plan.code_query,
+            "books_query": plan.books_query,
+            "memory_query": plan.memory_query,
+            "code_refs": code_refs,
+            "book_refs": book_refs,
+        },
     )
 
 
 def build_system_prompt(plan: QueryPlan, context: RetrievedContext) -> str:
-    if plan.response_mode == "ultra-short":
-        answer_contract = (
-            "Формат ответа: 5-8 строк максимум, без вводных фраз и без воды.\n"
-            "Структура: диагноз -> что делать -> если нужен diff, покажи только ключевой фрагмент."
-        )
+    if plan.ultra_short:
+        contract = "Ответ строго 5-8 строк, без воды, сначала диагноз, затем действие, потом проверка."
     elif plan.response_mode == "diff":
-        answer_contract = (
-            "Формат ответа:\n"
-            "1. Короткий диагноз.\n"
-            "2. Минимальный Go diff или точечный код.\n"
-            "3. Краткое объяснение.\n"
-            "4. Что проверить после изменения."
-        )
+        contract = "Дай короткий диагноз, затем минимальный diff/patch, затем 2-3 проверки после фикса."
     elif plan.response_mode == "plan":
-        answer_contract = (
-            "Формат ответа:\n"
-            "1. Диагноз текущего решения.\n"
-            "2. Целевая архитектура без лишних паттернов.\n"
-            "3. Пошаговый план миграции.\n"
-            "4. Риски и критерии успеха."
-        )
+        contract = "Дай короткий диагноз, целевую архитектуру, шаги миграции и риски."
     else:
-        answer_contract = (
-            "Формат ответа:\n"
-            "1. Короткий ответ по сути.\n"
-            "2. Причина проблемы.\n"
-            "3. Минимальное изменение.\n"
-            "4. Что проверить."
-        )
-
+        contract = "Дай прикладной ответ по существу, без длинной теории."
     return (
-        "Ты Go-помощник внутри IDE с RAG по книгам и коду проекта.\n"
-        "Сначала определи, чего хочет пользователь. Затем опирайся на код проекта. После этого применяй правила из книг к найденному коду.\n"
-        "Приоритет источников: код проекта > книги > память.\n\n"
-        "Жесткие правила:\n"
-        "- Не отвечай на другой вопрос, кроме исходного.\n"
-        "- Не придумывай пакеты, файлы, функции и зависимости, которых нет в проектном контексте.\n"
-        "- Не пересказывай книги абстрактно: используй их как проверку и объяснение для конкретного кода.\n"
-        "- Не навязывай DDD/CQRS/Event Sourcing без явного запроса.\n"
-        "- Если контекста не хватает, скажи этого прямо.\n"
-        "- Предпочитай минимальное изменение существующего решения.\n\n"
-        f"{answer_contract}\n\n"
-        f"КНИГИ:\n{context.books or 'Нет данных.'}\n\n"
-        f"КОД ПРОЕКТА:\n{context.project or 'Нет данных.'}\n\n"
-        f"ПАМЯТЬ:\n{context.memory or 'Нет данных.'}"
+        "Ты coding assistant для IDE.\n"
+        "Порядок: пойми вопрос -> опирайся на код проекта -> примени знания из книг -> сформируй ответ.\n"
+        "Приоритет источников: код > книги > память.\n"
+        "Не выдумывай файлы, функции и пакеты.\n"
+        "Если контекста не хватает — скажи это явно.\n"
+        f"{contract}\n\n"
+        f"КОД ПРОЕКТА:\n{context.project or 'Нет данных'}\n\n"
+        f"КНИГИ:\n{context.books or 'Нет данных'}\n\n"
+        f"ПАМЯТЬ:\n{context.memory or 'Нет данных'}"
     )
 
 
 def build_messages(system_prompt: str, incoming_messages: List[Dict], user_query: str) -> List[Dict]:
     recent = incoming_messages[-(RECENT_MESSAGES_LIMIT + 1):-1] if len(incoming_messages) > 1 else []
-    cleaned_recent = []
+    cleaned = []
     for msg in recent:
         role = msg.get("role")
         content = (msg.get("content") or "").strip()
         if role in {"user", "assistant"} and content:
-            cleaned_recent.append({"role": role, "content": trim_text(content, 1000)})
-    return [{"role": "system", "content": system_prompt}] + cleaned_recent + [{"role": "user", "content": user_query}]
+            cleaned.append({"role": role, "content": trim_text(content, 900)})
+    return [{"role": "system", "content": system_prompt}] + cleaned + [{"role": "user", "content": user_query}]
 
 
 def build_reviewer_prompt(user_query: str, plan: QueryPlan) -> str:
-    extra = "Проверь, не стал ли ответ длиннее 8 строк." if plan.ultra_short else "Проверь, не стал ли ответ излишне многословным."
+    length_rule = "Проверь, что ответ реально помещается в 5-8 строк." if plan.ultra_short else "Проверь, что ответ не расползся без пользы."
     return (
-        f"Проведи короткий аудит ответа на исходный запрос: '{user_query}'.\n"
-        "Проверь только следующее:\n"
-        "1. Есть ли уход в сторону от вопроса пользователя.\n"
-        "2. Есть ли выдуманные сущности, которых нет в коде проекта.\n"
-        "3. Есть ли плохие советы для Go: race, deadlock, goroutine leak, channel misuse, context misuse.\n"
-        f"4. {extra}\n"
-        "Верни только список замечаний. Если всё хорошо, верни OK."
+        f"Проведи короткий аудит ответа на запрос: '{user_query}'.\n"
+        "Проверь: уход в сторону, выдуманные сущности, опасные советы по Go, лишнюю сложность.\n"
+        f"{length_rule}\n"
+        "Верни только замечания. Если всё хорошо, верни OK."
     )
 
 
-def build_final_prompt(user_query: str, review_feedback: str, plan: QueryPlan) -> str:
-    brevity = "Ответ должен остаться в 5-8 строк." if plan.ultra_short else "Сохрани ответ коротким и прикладным."
+def build_repair_prompt(user_query: str, review_feedback: str, plan: QueryPlan) -> str:
+    brevity = "Оставь ответ в 5-8 строк." if plan.ultra_short else "Оставь ответ коротким."
     return (
-        f"Исходный запрос пользователя: '{user_query}'.\n"
+        f"Исходный запрос: {user_query}\n"
         f"Замечания ревьюера:\n{review_feedback}\n\n"
-        "Пересобери финальный ответ.\n"
-        "Исправь только реальные замечания.\n"
-        "Не добавляй новые идеи, если они не нужны для решения вопроса.\n"
-        f"{brevity}"
+        f"Пересобери финальный ответ. {brevity} Не добавляй новые идеи без необходимости."
     )
 
 
-@app.route("/api/tags", methods=["GET"])
-def mock_tags():
-    return safe_json_response({
-        "models": [
-            {"name": ANSWER_MODEL, "model": ANSWER_MODEL},
-            {"name": REVIEW_MODEL, "model": REVIEW_MODEL},
-        ]
-    })
+def save_memory(user_query: str, answer: str) -> None:
+    vector = get_query_embedding(user_query)
+    if not vector or not answer.strip():
+        return
+    try:
+        memory_collection.add(
+            embeddings=[vector],
+            documents=[f"Вопрос пользователя: {user_query}\nКраткий ответ: {trim_text(answer, 1200)}"],
+            ids=[f"mem_{int(time.time() * 1000)}"],
+            metadatas=[{"score": 1.0, "timestamp": time.time()}],
+        )
+    except Exception as exc:
+        print(f"[!] Save memory error: {exc}")
 
 
-@app.route("/api/show", methods=["POST"])
-def mock_show():
-    return safe_json_response({"modelfile": f"FROM {ANSWER_MODEL}"})
+def run_pipeline(user_query: str, incoming_messages: List[Dict], mode: str, include_debug: bool) -> Tuple[str, Dict]:
+    cpu_load = get_cpu_load_macos()
+    silent_mode = cpu_load > CPU_HEAVY_THRESHOLD
+    base_plan = build_base_plan(user_query, mode)
+    plan = base_plan if silent_mode else planner_refine(user_query, base_plan, incoming_messages)
+    context = build_context(plan)
+    system_prompt = build_system_prompt(plan, context)
+    messages = build_messages(system_prompt, incoming_messages, user_query)
+    draft = call_ollama_text(ANSWER_MODEL, messages)
+    final_answer = draft
+    review_feedback = ""
+    if plan.needs_review and not silent_mode and draft.strip():
+        review_feedback = call_ollama_text(REVIEW_MODEL, messages + [{"role": "assistant", "content": draft}, {"role": "user", "content": build_reviewer_prompt(user_query, plan)}])
+        if review_feedback.strip() and review_feedback.strip().upper() != "OK":
+            final_answer = call_ollama_text(
+                ANSWER_MODEL,
+                messages
+                + [{"role": "assistant", "content": draft}]
+                + [{"role": "user", "content": build_repair_prompt(user_query, review_feedback, plan)}],
+            )
+    save_memory(user_query, final_answer)
+    debug = {
+        "cpu_load": cpu_load,
+        "silent_mode": silent_mode,
+        "plan": plan.__dict__,
+        "retrieval": context.meta,
+        "review_feedback": review_feedback,
+    }
+    if include_debug:
+        return final_answer, debug
+    return final_answer, {}
 
 
 @app.after_request
@@ -394,99 +353,143 @@ def add_cors_headers(response):
     return response
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "multi-ide-rag"})
+
+
+@app.route("/api/tags", methods=["GET"])
+def ollama_tags():
+    return jsonify({"models": [{"name": ANSWER_MODEL, "model": ANSWER_MODEL}, {"name": REVIEW_MODEL, "model": REVIEW_MODEL}]})
+
+
+@app.route("/api/show", methods=["POST"])
+def ollama_show():
+    return jsonify({"modelfile": f"FROM {ANSWER_MODEL}"})
+
+
+@app.route("/api/chat", methods=["POST"])
+def ollama_chat_proxy():
+    data = request.json or {}
+    incoming_messages = data.get("messages", [])
+    mode = data.get("mode", "default")
+    include_debug = bool(data.get("debug", False))
+    if not incoming_messages:
+        return jsonify({"message": {"role": "assistant", "content": "Нет сообщений."}, "done": True})
+    user_query = (incoming_messages[-1].get("content") or "").strip()
+    if not user_query:
+        return jsonify({"message": {"role": "assistant", "content": "Пустой запрос."}, "done": True})
+
+    def generate():
+        answer, debug = run_pipeline(user_query, incoming_messages, mode, include_debug)
+        if include_debug:
+            yield make_ollama_chunk(f"[debug]\n{json.dumps(debug, ensure_ascii=False, indent=2)}\n\n")
+        yield make_ollama_chunk(answer)
+        yield make_ollama_chunk("", done=True)
+
+    return Response(generate(), mimetype="application/x-ndjson")
+
+
+@app.route("/v1/models", methods=["GET"])
+def openai_models():
+    return jsonify({
+        "object": "list",
+        "data": [
+            {"id": ANSWER_MODEL, "object": "model", "owned_by": "local"},
+            {"id": REVIEW_MODEL, "object": "model", "owned_by": "local"},
+        ],
+    })
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def openai_chat_completions():
+    data = request.json or {}
+    incoming_messages = data.get("messages", [])
+    stream = bool(data.get("stream", True))
+    mode = data.get("metadata", {}).get("mode", "default") if isinstance(data.get("metadata"), dict) else "default"
+    include_debug = bool((data.get("metadata") or {}).get("debug", False)) if isinstance(data.get("metadata"), dict) else False
+
+    if not incoming_messages:
+        return jsonify({"error": {"message": "Нет сообщений."}}), 400
+    user_query = (incoming_messages[-1].get("content") or "").strip()
+    if not user_query:
+        return jsonify({"error": {"message": "Пустой запрос."}}), 400
+
+    answer, debug = run_pipeline(user_query, incoming_messages, mode, include_debug)
+    full_text = answer if not include_debug else f"[debug]\n{json.dumps(debug, ensure_ascii=False, indent=2)}\n\n{answer}"
+
+    if not stream:
+        return jsonify({
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": ANSWER_MODEL,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}],
+        })
+
+    def sse_stream():
+        chunk = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": ANSWER_MODEL,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": full_text}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        end_chunk = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": ANSWER_MODEL,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(sse_stream(), mimetype="text/event-stream")
+
+
+@app.route("/v1/responses", methods=["POST"])
+def openai_responses():
+    data = request.json or {}
+    input_items = data.get("input", [])
+    metadata = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+    mode = metadata.get("mode", "default")
+    include_debug = bool(metadata.get("debug", False))
+
+    incoming_messages = []
+    for item in input_items:
+        if item.get("role") in {"user", "assistant", "system"}:
+            content = item.get("content")
+            if isinstance(content, list):
+                text_parts = [x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") in {"input_text", "output_text", "text"}]
+                content = "\n".join([x for x in text_parts if x])
+            incoming_messages.append({"role": item.get("role"), "content": content or ""})
+    if not incoming_messages:
+        return jsonify({"error": {"message": "Нет input."}}), 400
+    user_query = (incoming_messages[-1].get("content") or "").strip()
+    answer, debug = run_pipeline(user_query, incoming_messages, mode, include_debug)
+    output_text = answer if not include_debug else f"[debug]\n{json.dumps(debug, ensure_ascii=False, indent=2)}\n\n{answer}"
+    return jsonify({
+        "id": f"resp_{int(time.time())}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": ANSWER_MODEL,
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": output_text}]}],
+        "output_text": output_text,
+    })
+
+
 @app.route("/api/rebuild-db", methods=["POST"])
 def manual_rebuild_db():
     thread = threading.Thread(target=rebuild_vector_db, daemon=True)
     thread.start()
-    return {"status": "rebuilding", "message": "Пересборка БД Qdrant запущена в фоне"}
-
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    data = request.json or {}
-    incoming_messages = data.get("messages", [])
-    mode = data.get("mode", "default")
-
-    if not incoming_messages:
-        return safe_json_response({"message": {"role": "assistant", "content": "Нет сообщений."}})
-
-    user_query = (incoming_messages[-1].get("content") or "").strip()
-    if not user_query:
-        return safe_json_response({"message": {"role": "assistant", "content": "Пустой запрос."}})
-
-    cpu_load = get_cpu_load_macos()
-    silent_mode = cpu_load > CPU_HEAVY_THRESHOLD
-    print(f"\n[📥] Запрос из IDE | CPU load: {cpu_load:.1f}% | mode={mode}")
-
-    query_vector = get_query_embedding(user_query)
-    base_plan = build_query_plan(user_query, mode)
-    plan = planner_refine_plan(user_query, base_plan, incoming_messages) if not silent_mode else base_plan
-    context = build_context(query_vector, plan)
-    system_prompt = build_system_prompt(plan, context)
-    base_messages = build_messages(system_prompt, incoming_messages, user_query)
-
-    def generate():
-        full_answer = ""
-        try:
-            if not silent_mode:
-                yield safe_yield(f"[Plan] task={plan.task_type}, mode={plan.response_mode}, books={plan.books_top_k}, code={plan.project_top_k}\n\n")
-                yield safe_yield("[RAG] Сначала собрал план, затем достал код, потом применил знания из книг.\n\n")
-
-            draft_answer = call_ollama_text(ANSWER_MODEL, base_messages)
-            if not draft_answer.strip():
-                yield safe_yield("Пустой ответ от основной модели.")
-                yield b'{"done": true}\n'
-                return
-
-            final_messages = base_messages + [{"role": "assistant", "content": draft_answer}]
-
-            if plan.needs_review and not silent_mode:
-                yield safe_yield("[Review] Проверяю ответ на уход в сторону, выдумки и лишнюю сложность.\n\n")
-                review_prompt = build_reviewer_prompt(user_query, plan)
-                review_feedback = call_ollama_text(
-                    REVIEW_MODEL,
-                    final_messages + [{"role": "user", "content": review_prompt}],
-                )
-                if review_feedback.strip() and review_feedback.strip().upper() != "OK":
-                    final_prompt = build_final_prompt(user_query, review_feedback, plan)
-                    final_messages = final_messages + [
-                        {"role": "user", "content": review_prompt},
-                        {"role": "assistant", "content": review_feedback},
-                        {"role": "user", "content": final_prompt},
-                    ]
-
-            stream_model = REVIEW_MODEL if plan.needs_review and not silent_mode else ANSWER_MODEL
-            response = ollama_chat(stream_model, final_messages, stream=True, timeout=360)
-            if response.status_code != 200:
-                error_text = f"Ollama ошибка {response.status_code}: {response.text}"
-                yield safe_yield(error_text)
-                yield b'{"done": true}\n'
-                return
-
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                yield line + b"\n"
-                try:
-                    chunk_json = json.loads(line.decode("utf-8"))
-                    content = chunk_json.get("message", {}).get("content", "")
-                    full_answer += content
-                except json.JSONDecodeError:
-                    continue
-
-            if not full_answer.strip():
-                yield safe_yield("[⚠️] Модель вернула пустой ответ. Проверь длину контекста или память.")
-            else:
-                save_to_long_term_memory(user_query, full_answer, query_vector)
-        except Exception as exc:
-            yield safe_yield(f"[Ошибка]: {exc}")
-            yield b'{"done": true}\n'
-
-    return Response(generate(), mimetype="application/x-ndjson")
+    return jsonify({"status": "rebuilding", "message": "Пересборка БД Qdrant запущена в фоне"})
 
 
 if __name__ == "__main__":
     crawler = threading.Thread(target=async_knowledge_crawler, daemon=True)
     crawler.start()
-    print("[🚀] RAG server запущен на http://localhost:5001")
+    print("[🚀] Multi-IDE RAG server запущен на http://localhost:5001")
     app.run(host="localhost", port=5001, use_reloader=False)
