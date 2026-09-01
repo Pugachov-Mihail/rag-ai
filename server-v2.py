@@ -177,10 +177,16 @@ def query_qdrant(collection_name: str, query_text: str, limit: int) -> List[Dict
     if not vector:
         return []
     try:
-        result = qdrant_client.query_points(collection_name=collection_name, query=vector, limit=limit)
-        return [point.payload or {} for point in result.points]
+        res = qdrant_client.query_points(
+            collection_name=collection_name,
+            query=vector,          # сюда идёт list[float]
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [p.payload or {} for p in res.points]
     except Exception as exc:
-        print(f"[!] Qdrant search error in {collection_name}: {exc}")
+        print(f"[!] Qdrant query_points error in {collection_name}: {exc}")
         return []
 
 

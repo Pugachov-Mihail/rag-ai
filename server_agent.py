@@ -190,14 +190,16 @@ def query_qdrant(collection_name: str, query_text: str, limit: int) -> List[Dict
     if not vector:
         return []
     try:
-        results = qdrant_client.search_matrix_pairs(
+        res = qdrant_client.query_points(
             collection_name=collection_name,
-            query_vector=vector,
+            query=vector,          # сюда идёт list[float]
             limit=limit,
+            with_payload=True,
+            with_vectors=False,
         )
-        return [r or {} for r in results]
+        return [p.payload or {} for p in res.points]
     except Exception as exc:
-        print(f"[!] Qdrant search_matrix_pairs error in {collection_name}: {exc}")
+        print(f"[!] Qdrant query_points error in {collection_name}: {exc}")
         return []
 
 
