@@ -332,7 +332,7 @@ class ProjectContextUpdater:
 
             arch_points.append(
                 PointStruct(
-                    id=f"arch_{idx}",
+                    id=idx,
                     vector=vector,
                     payload=payload,
                 )
