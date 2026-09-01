@@ -206,6 +206,7 @@ def safe_yield(text_content):
 def mock_chat():
     data = request.json or {}
     messages = data.get("messages", [])
+    mode = data.get("mode", "default")
     if not messages:
         return json.dumps({"message": {"role": "assistant", "content": "Нет сообщений."}})
 
@@ -238,6 +239,136 @@ def mock_chat():
     # 2. ОГРАНИЧЕНИЕ ИСТОРИИ (Берем только последние 3 сообщения, чтобы IDE не забивала память)
     recent_messages = messages[-4:-1] if len(messages) > 3 else messages[:-1]
     agent_messages = [{"role": "system", "content": system_instruction}] + recent_messages
+
+    def generate_consult():
+        full_consultation = ""
+
+        try:
+            # ============ ЭТАП 1: АНАЛИЗ ТЕКУЩЕЙ РЕАЛИЗАЦИИ ============
+            yield safe_yield("[🔍 ЭТАП 1/4: Анализ текущей реализации в проекте...]\n\n")
+            print("\n[🔍 ЭТАП 1/4: Анализ текущей реализации]")
+
+            analysis_system = (
+                "Ты — детальный аудитор кода Go.\n"
+                "Проанализируй ТЕКУЩУЮ реализацию из базы проекта и скажи:\n"
+                "1. Текущая архитектура и её слабые места\n"
+                "2. Какие паттерны уже используются\n"
+                "3. Технические долги и проблемы масштабируемости\n"
+                "4. Совместимость с best practices Go\n\n"
+                f"ТЕКУЩАЯ РЕАЛИЗАЦИЯ:\n{project_context}\n\n"
+                f"ТЕОРИЯ (best practices):\n{books_context}"
+            )
+
+            analysis_messages = [
+                {"role": "system", "content": analysis_system},
+                {"role": "user", "content": f"Проанализируй текущую реализацию относительно задачи: '{user_query}'"}
+            ]
+
+            analysis_result = call_ollama(MODEL_CRITIC, analysis_messages)
+            yield safe_yield(f"{analysis_result}\n\n")
+            full_consultation += f"[АНАЛИЗ РЕАЛИЗАЦИИ]\n{analysis_result}\n\n"
+
+            # ============ ЭТАП 2: АРХИТЕКТУРНЫЕ РЕКОМЕНДАЦИИ ============
+            yield safe_yield("[🏗️ ЭТАП 2/4: Генерация архитектурных рекомендаций...]\n\n")
+            print("\n[🏗️ ЭТАП 2/4: Архитектурные рекомендации]")
+
+            architect_system = (
+                "Ты — ведущий архитектор систем на Go.\n"
+                "На основе анализа реализации дай АРХИТЕКТУРНЫЕ РЕКОМЕНДАЦИИ:\n"
+                "1. Какой паттерн использовать (DDD, CQRS, Event Sourcing, etc.)\n"
+                "2. Как переструктурировать модули\n"
+                "3. Какие интерфейсы/абстракции добавить\n"
+                "4. План миграции (пошагово, без кода)\n"
+                "5. Риски и как их миtigировать\n\n"
+                f"ТЕКУЩЕЕ СОСТОЯНИЕ:\n{analysis_result[:2000]}\n\n"
+                f"ПРОЕКТ:\n{project_context[:2000]}"
+            )
+
+            architect_messages = [
+                {"role": "system", "content": architect_system},
+                {"role": "user",
+                 "content": f"Задача пользователя: '{user_query}'\n\nДай архитектурный план переделки (БЕЗ КОДА)."}
+            ]
+
+            architect_result = call_ollama(MODEL_CREATOR, architect_messages)
+            yield safe_yield(f"{architect_result}\n\n")
+            full_consultation += f"[АРХИТЕКТУРНЫЙ ПЛАН]\n{architect_result}\n\n"
+
+            # ============ ЭТАП 3: КРИТИЧЕСКИЙ РАЗБОР ПОЛЬЗОВАТЕЛЯ ============
+            yield safe_yield("[💭 ЭТАП 3/4: Ваш ответ/уточнение (ожидание ввода)...]\n\n")
+            print("\n[💭 ЭТАП 3/4: Ожидаем Ваш ответ на рекомендации]")
+
+            # ЗДЕСЬ ПОЛУЧАЕМ ОТВЕТ ПОЛЬЗОВАТЕЛЯ ИЛИ ИСПОЛЬЗУЕМ ПОСЛЕДНИЙ МЕССЕДЖ
+            # Если это многошаговый диалог, можно дождаться нового сообщения
+            # Сейчас используем текущее сообщение как отклик
+            user_response = user_query  # Или получить из нового запроса
+
+            yield safe_yield(f"[Ваш ответ: {user_response}]\n\n")
+            full_consultation += f"[ОТВЕТ ПОЛЬЗОВАТЕЛЯ]\n{user_response}\n\n"
+
+            # ============ ЭТАП 4: ФИНАЛЬНАЯ КОНСОЛИДАЦИЯ ============
+            yield safe_yield("[🎯 ЭТАП 4/4: Финальная консолидация рекомендаций...]\n\n")
+            print("\n[🎯 ЭТАП 4/4: Финальная консолидация]")
+
+            final_system = (
+                "Ты — chief architect. Проведи финальный разбор:\n"
+                "1. Зафиксируй, что сделано хорошо в текущей реализации\n"
+                "2. Какие архитектурные принципы нарушены\n"
+                "3. Окончательный план действий (пошагово)\n"
+                "4. Метрики успеха переделки\n"
+                "5. Зависимости между этапами\n\n"
+                f"АНАЛИЗ:\n{analysis_result[:1500]}\n\n"
+                f"АРХИТЕКТУРНЫЙ ПЛАН:\n{architect_result[:1500]}\n\n"
+                f"ОБРАТНАЯ СВЯЗЬ ПОЛЬЗОВАТЕЛЯ:\n{user_response[:1000]}"
+            )
+
+            final_messages = [
+                {"role": "system", "content": final_system},
+                {"role": "user",
+                 "content": f"Задача: '{user_query}'\n\nКонсолидируй все выше в финальный план действий."}
+            ]
+
+            print(f"\n==================== ФИНАЛЬНАЯ КОНСУЛЬТАЦИЯ ====================")
+            response = requests.post(
+                OLLAMA_CHAT_URL,
+                json={"model": MODEL_CRITIC, "messages": final_messages, "stream": True},
+                stream=True, timeout=360
+            )
+
+            if response.status_code != 200:
+                error_text = f"Ollama ошибка {response.status_code}: {response.text}"
+                print(f"\n[!] ОШИБКА: {error_text}")
+                yield safe_yield(f"\n[Ошибка]: {error_text}")
+                yield b'{"done": True}\n'
+                return
+
+            for line in response.iter_lines():
+                if line:
+                    yield line + b'\n'
+                    try:
+                        chunk_json = json.loads(line.decode('utf-8'))
+                        if "message" in chunk_json and "content" in chunk_json["message"]:
+                            content = chunk_json["message"]["content"]
+                            print(content, end="", flush=True)
+                            full_consultation += content
+                    except json.JSONDecodeError:
+                        pass
+
+            print("\n=====================================================================\n")
+
+            if not full_consultation.strip():
+                warning_msg = "\n[⚠️] Консультация вернула пустой результат."
+                print(warning_msg)
+                yield safe_yield(warning_msg)
+            elif query_vector:
+                save_to_long_term_memory(user_query, full_consultation, query_vector)
+                print("[📢] Полная консультация сохранена в память.")
+
+        except Exception as e:
+            error_msg = f"\n[Ошибка]: {str(e)}"
+            print(error_msg)
+            yield safe_yield(error_msg)
+            yield b'{"done": True}\n'
 
     def generate():
         nonlocal agent_messages
@@ -345,6 +476,8 @@ def mock_chat():
             yield safe_yield(error_msg)
             yield b'{"done": True}\n'
 
+    if mode == "consult":
+        return Response(generate_consult(), mimetype='application/x-ndjson')
     return Response(generate(), mimetype='application/x-ndjson')
 
 @app.route('/api/rebuild-db', methods=['POST'])
