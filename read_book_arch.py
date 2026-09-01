@@ -98,7 +98,6 @@ def rebuild_vector_db() -> None:
     print("[🔄] Полная пересборка Qdrant...")
     try:
         updater.qdrant.delete_collection(collection_name="go_project_context")
-        updater.qdrant.delete_collection(collection_name="books_collection")
         updater.qdrant.delete_collection(collection_name="project_arch_profile")
     except Exception as e:
         print(f"[!] Ошибка удаления коллекций: {e}")
